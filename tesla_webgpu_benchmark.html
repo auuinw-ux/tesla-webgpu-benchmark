@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tesla WebGPU Benchmark</title>
+<style>
+html,body{margin:0;background:#101114;color:#eee;font-family:system-ui,-apple-system,sans-serif}
+body{padding:18px;box-sizing:border-box}
+h1{font-size:24px;margin:0 0 6px}
+p{color:#aaa;margin:6px 0 16px}
+button{font-size:18px;padding:12px 18px;border:0;border-radius:10px;margin:5px 5px 5px 0}
+#stop{display:none}
+#status{padding:12px;border-radius:10px;background:#1b1d22;margin:12px 0;white-space:pre-wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.card{background:#1b1d22;padding:12px;border-radius:10px}
+.label{font-size:12px;color:#999}.value{font-size:19px;margin-top:3px}
+#canvas{width:100%;height:260px;background:#000;border-radius:10px;display:block}
+small{color:#777}
+</style>
+</head>
+<body>
+<h1>🚗 Tesla WebGPU Benchmark</h1>
+<p>Local test — no cloud, no server-side rendering. Open this page in the Tesla browser.</p>
+
+<button id="start">Start Benchmark</button>
+<button id="stop">Stop</button>
+
+<div id="status">Ready.</div>
+<canvas id="canvas"></canvas>
+
+<div class="grid">
+  <div class="card"><div class="label">WebGPU</div><div class="value" id="gpu">—</div></div>
+  <div class="card"><div class="label">Adapter</div><div class="value" id="adapter">—</div></div>
+  <div class="card"><div class="label">FPS</div><div class="value" id="fps">—</div></div>
+  <div class="card"><div class="label">Frame time</div><div class="value" id="frame">—</div></div>
+  <div class="card"><div class="label">Objects</div><div class="value" id="objects">—</div></div>
+  <div class="card"><div class="label">Test time</div><div class="value" id="time">—</div></div>
+</div>
+
+<p><small>Benchmark is intentionally simple. FPS is an application-level result, not a direct GPU TFLOPS measurement.</small></p>
+
+<script>
+const $ = id => document.getElementById(id);
+let running=false, raf=0, startTime=0, last=0, frames=0, fpsWindow=0;
+let device, context, pipeline, vertexBuffer, uniformBuffer, bindGroup;
+
+function mat4Perspective(fov, aspect, near, far){
+  const f=1/Math.tan(fov/2), nf=1/(near-far);
+  return new Float32Array([
+    f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1,
+    0,0,(2*far*near)*nf,0
+  ]);
+}
+function mul(a,b){
+  const o=new Float32Array(16);
+  for(let c=0;c<4;c++)for(let r=0;r<4;r++)
+    o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];
+  return o;
+}
+function translate(x,y,z){
+  return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
+}
+function rotateY(a){
+  const c=Math.cos(a),s=Math.sin(a);
+  return new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1]);
+}
+
+async function init(){
+  if(!navigator.gpu){
+    $("gpu").textContent="Not supported";
+    $("status").textContent="WebGPU is not available in this browser.";
+    return false;
+  }
+  $("gpu").textContent="Supported";
+  const adapter=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
+  if(!adapter){ $("status").textContent="No WebGPU adapter found."; return false; }
+  let info={};
+  try { info=await adapter.requestAdapterInfo(); } catch(e) {}
+  $("adapter").textContent=(info.vendor||"unknown")+" / "+(info.architecture||"unknown");
+  device=await adapter.requestDevice();
+
+  const canvas=$("canvas");
+  const dpr=Math.min(devicePixelRatio||1,2);
+  canvas.width=Math.floor(canvas.clientWidth*dpr);
+  canvas.height=Math.floor(canvas.clientHeight*dpr);
+  context=canvas.getContext("webgpu");
+  const format=navigator.gpu.getPreferredCanvasFormat();
+  context.configure({device,format,alphaMode:"opaque"});
+
+  const vertices=new Float32Array([
+    -0.5,-0.5,0,  0.5,-0.5,0,  0.5,0.5,0,
+    -0.5,-0.5,0,  0.5,0.5,0, -0.5,0.5,0
+  ]);
+  vertexBuffer=device.createBuffer({size:vertices.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(vertexBuffer,0,vertices);
+
+  uniformBuffer=device.createBuffer({size:64,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+
+  const shader=device.createShaderModule({code:`
+struct U { mvp: mat4x4<f32> }
+@group(0) @binding(0) var<uniform> u: U;
+
+struct Out { @builtin(position) pos: vec4<f32>; @location(0) color: vec3<f32>; }
+
+@vertex fn vs(@location(0) p: vec3<f32>, @builtin(instance_index) i: u32) -> Out {
+  var o:Out;
+  let x = f32(i % 40u) - 19.5;
+  let y = f32((i / 40u) % 25u) - 12.0;
+  let z = -f32(i / 1000u) * 0.7;
+  let s = 0.035 + f32(i % 7u)*0.002;
+  let t = vec3<f32>(x*0.11, y*0.11, z);
+  o.pos = u.mvp * vec4<f32>(p*s+t,1.0);
+  o.color = vec3<f32>(
+    0.35 + f32(i%5u)*0.12,
+    0.45 + f32(i%3u)*0.15,
+    0.7
+  );
+  return o;
+}
+@fragment fn fs(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
+  return vec4<f32>(c,1.0);
+}`});
+
+  pipeline=device.createRenderPipeline({
+    layout:"auto",
+    vertex:{module:shader,entryPoint:"vs",buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:"float32x3"}]}]},
+    fragment:{module:shader,entryPoint:"fs",targets:[{format}]},
+    primitive:{topology:"triangle-list"}
+  });
+  bindGroup=device.createBindGroup({
+    layout:pipeline.getBindGroupLayout(0),
+    entries:[{binding:0,resource:{buffer:uniformBuffer}}]
+  });
+  return true;
+}
+
+function draw(t){
+  if(!running)return;
+  const elapsed=(t-startTime)/1000;
+  const aspect=$("canvas").width/$("canvas").height;
+  const proj=mat4Perspective(1.0,aspect,0.1,100);
+  const view=translate(0,0,-3.5);
+  const model=rotateY(elapsed*0.4);
+  const mvp=mul(proj,mul(view,model));
+  device.queue.writeBuffer(uniformBuffer,0,mvp);
+
+  const enc=device.createCommandEncoder();
+  const pass=enc.beginRenderPass({
+    colorAttachments:[{view:context.getCurrentTexture().createView(),
+      clearValue:{r:.02,g:.02,b:.025,a:1},loadOp:"clear",storeOp:"store"}]
+  });
+  pass.setPipeline(pipeline);
+  pass.setVertexBuffer(0,vertexBuffer);
+  pass.setBindGroup(0,bindGroup);
+  const objects=4000;
+  pass.draw(6,objects,0,0);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  frames++;
+  if(t-last>=1000){
+    $("fps").textContent=frames+" FPS";
+    $("frame").textContent=(1000/frames).toFixed(1)+" ms";
+    frames=0; last=t;
+  }
+  $("objects").textContent=objects.toLocaleString();
+  $("time").textContent=elapsed.toFixed(1)+" s";
+  raf=requestAnimationFrame(draw);
+}
+
+$("start").onclick=async()=>{
+  $("start").disabled=true;
+  $("status").textContent="Initializing WebGPU...";
+  if(!await init()){ $("start").disabled=false; return; }
+  running=true; startTime=performance.now(); last=startTime; frames=0;
+  $("stop").style.display="inline-block";
+  $("status").textContent="Running local WebGPU benchmark…\nKeep the page visible for 30–60 seconds.";
+  raf=requestAnimationFrame(draw);
+};
+$("stop").onclick=()=>{
+  running=false; cancelAnimationFrame(raf);
+  $("stop").style.display="none"; $("start").disabled=false;
+  $("status").textContent="Stopped. Record the FPS and adapter information above.";
+};
+</script>
+</body>
+</html>
